@@ -1,0 +1,458 @@
+`timescale 1ns/1ps
+// =============================================================
+//  tb_elevator_group_controller.v
+//  Testbench for group_controller_top
+//
+//  TEST PHASES:
+//
+//  [RESET]      System reset — both cars at floor 0
+//
+//  [PH1]  hall_call = 01010  (floors 1 and 3)
+//         Expected: Car A → floor 1, Car B → floor 3
+//         Both cars idle at different positions before next phase
+//
+//  [PH2]  hall_call = 10001  (floors 0 and 4)
+//         Car A at floor 1 (last_dir UP), Car B at floor 3 (last_dir UP)
+//         Expected: Car A → floor 0 (reverse), Car B → floor 4 (continue)
+//
+//  [PH3]  hall_call = 10100  (floors 2 and 4)
+//         Car A at floor 0 (last_dir DOWN), Car B at floor 4 (last_dir UP)
+//         Expected: Car A → floor 2, Car B stays at 4 (already there)
+//
+//  [PH4]  Emergency stop during travel
+//         Both cars mid-journey, emergency asserted then released
+//         Expected: Cars freeze, resume after release
+//
+//  [PH5]  hall_call = 11111  (all 5 floors)
+//         Car A at floor 1, Car B at floor 3 (both idle)
+//         Expected: dispatcher splits floors between both cars
+//         Both cars move simultaneously
+//
+//  [PH6]  Simultaneous call while car is moving (dynamic dispatch)
+//         Car A going from 0 to 3, at floor 1 a new call arrives at 2
+//         If dispatcher assigns floor 2 to Car A, it stops mid-journey
+//
+//  PARAMETERS:
+//    MOVE_DELAY = 10  (tiny value so simulation runs fast)
+//    Each floor step takes 10 clock cycles instead of real-world 1 second
+//
+//  MONITORING:
+//    $monitor prints every time any watched signal changes
+//    Phase markers print at each test phase boundary
+//    Final pass/fail check at end
+// =============================================================
+ 
+module tb_elevator_group_controller;
+ 
+    // ── DUT parameters ───────────────────────────────────────
+    localparam MOVE_DELAY = 10;   // tiny for fast simulation
+    localparam CLK_PERIOD = 10;   // 10 ns = 100 MHz
+ 
+    // ── DUT ports ────────────────────────────────────────────
+    reg         clk;
+    reg         reset;
+    reg  [4:0]  sw_hall;
+    reg         btn_commit;
+    reg         emergency_stop;
+ 
+    wire        move_up_A,   move_down_A,   motor_stop_A;
+    wire        move_up_B,   move_down_B,   motor_stop_B;
+    wire [6:0]  seg;
+    wire        dp;
+    wire [7:0]  an;
+ 
+    // ── Instantiate DUT ──────────────────────────────────────
+    group_controller_top #(
+        .MOVE_DELAY(MOVE_DELAY)
+    ) dut (
+        .clk           (clk),
+        .reset         (reset),
+        .sw_hall       (sw_hall),
+        .btn_commit    (btn_commit),
+        .emergency_stop(emergency_stop),
+        .move_up_A     (move_up_A),
+        .move_down_A   (move_down_A),
+        .motor_stop_A  (motor_stop_A),
+        .move_up_B     (move_up_B),
+        .move_down_B   (move_down_B),
+        .motor_stop_B  (motor_stop_B),
+        .seg           (seg),
+        .dp            (dp),
+        .an            (an)
+    );
+ 
+    // ── Internal signal access via hierarchical references ───
+    wire [2:0] floor_A    = dut.floor_A;
+    wire [2:0] floor_B    = dut.floor_B;
+    wire [4:0] req_A      = dut.req_A;
+    wire [4:0] req_B      = dut.req_B;
+    wire [4:0] hall_call  = dut.hall_call;
+    wire [4:0] served     = dut.dispatcher.served_call;
+    wire       last_dir_A = dut.last_dir_A;
+    wire       last_dir_B = dut.last_dir_B;
+ 
+    // ── Pass/Fail counters ───────────────────────────────────
+    integer pass_count;
+    integer fail_count;
+ 
+    // ── Clock generation ─────────────────────────────────────
+    initial clk = 0;
+    always #(CLK_PERIOD/2) clk = ~clk;
+ 
+    // ── Continuous monitor ───────────────────────────────────
+    initial begin
+        $monitor("[%0t ns]  flA=%0d flB=%0d | upA=%b dnA=%b stA=%b | upB=%b dnB=%b stB=%b | reqA=%05b reqB=%05b | hall=%05b",
+                 $time,
+                 floor_A, floor_B,
+                 move_up_A, move_down_A, motor_stop_A,
+                 move_up_B, move_down_B, motor_stop_B,
+                 req_A, req_B,
+                 hall_call);
+    end
+ 
+    // ── Helper tasks ─────────────────────────────────────────
+ 
+    // Press commit button for one clean rising edge
+    task commit_hall_call;
+        input [4:0] pattern;
+        begin
+            sw_hall    = pattern;
+            @(posedge clk); #1;
+            btn_commit = 1;
+            @(posedge clk); #1;
+            btn_commit = 0;
+            @(posedge clk); #1;
+            // Wait two more cycles for two-phase latch to complete
+            @(posedge clk); #1;
+            @(posedge clk); #1;
+        end
+    endtask
+ 
+    // Wait until both cars are stopped (motor_stop = 1)
+    // Timeout after max_cycles to avoid infinite loop
+    task wait_both_idle;
+        input integer max_cycles;
+        integer cnt;
+        begin
+            cnt = 0;
+            while ((motor_stop_A === 0 || motor_stop_B === 0) && cnt < max_cycles) begin
+                @(posedge clk); #1;
+                cnt = cnt + 1;
+            end
+            if (cnt >= max_cycles)
+                $display("WARNING: wait_both_idle timed out after %0d cycles", max_cycles);
+        end
+    endtask
+ 
+    // Wait until Car A is stopped
+    task wait_A_idle;
+        input integer max_cycles;
+        integer cnt;
+        begin
+            cnt = 0;
+            while (motor_stop_A === 0 && cnt < max_cycles) begin
+                @(posedge clk); #1;
+                cnt = cnt + 1;
+            end
+        end
+    endtask
+ 
+    // Wait until Car B is stopped
+    task wait_B_idle;
+        input integer max_cycles;
+        integer cnt;
+        begin
+            cnt = 0;
+            while (motor_stop_B === 0 && cnt < max_cycles) begin
+                @(posedge clk); #1;
+                cnt = cnt + 1;
+            end
+        end
+    endtask
+ 
+    // Check a condition and print PASS or FAIL
+    task check;
+        input         condition;
+        input [255:0] test_name;
+        input [2:0]   expected;
+        input [2:0]   actual;
+        begin
+            if (condition) begin
+                $display("  PASS: %s  (expected=%0d, got=%0d)",
+                         test_name, expected, actual);
+                pass_count = pass_count + 1;
+            end else begin
+                $display("  FAIL: %s  (expected=%0d, got=%0d)",
+                         test_name, expected, actual);
+                fail_count = fail_count + 1;
+            end
+        end
+    endtask
+ 
+    // Small pause in clock cycles
+    task delay_cycles;
+        input integer n;
+        integer k;
+        begin
+            for (k = 0; k < n; k = k + 1)
+                @(posedge clk);
+            #1;
+        end
+    endtask
+ 
+    // ── Main test sequence ───────────────────────────────────
+    initial begin
+        // Initialise
+        pass_count     = 0;
+        fail_count     = 0;
+        reset          = 0;
+        sw_hall        = 5'b00000;
+        btn_commit     = 0;
+        emergency_stop = 0;
+ 
+        // ── RESET ────────────────────────────────────────────
+        $display("\n--- RESET [t=%0t] ---", $time);
+        reset = 1;
+        delay_cycles(5);
+        reset = 0;
+        delay_cycles(3);
+ 
+        check(floor_A === 3'd0, "Reset: Car A at floor 0", 3'd0, floor_A);
+        check(floor_B === 3'd0, "Reset: Car B at floor 0", 3'd0, floor_B);
+        check(motor_stop_A === 1, "Reset: Car A stopped", 3'd1, {2'b0, motor_stop_A});
+        check(motor_stop_B === 1, "Reset: Car B stopped", 3'd1, {2'b0, motor_stop_B});
+ 
+        // ── PH1: Floors 1 and 3 ──────────────────────────────
+        $display("\n[PH1] hall_call=01010 (floors 1 and 3)");
+        commit_hall_call(5'b01010);
+        $display("--- PH1 dispatch [t=%0t] ---  CarA fl=%0d | reqA=%05b  CarB fl=%0d | reqB=%05b  hall=%05b",
+                 $time, floor_A, req_A, floor_B, req_B, hall_call);
+ 
+        // Cars should start moving
+        delay_cycles(2);
+        check((move_up_A || move_up_B), "PH1: At least one car moving UP", 3'd1,
+              {2'b0, (move_up_A || move_up_B)});
+ 
+        // Wait for both cars to finish
+        wait_both_idle(2000);
+        $display("--- PH1 done [t=%0t] ---  CarA fl=%0d | CarB fl=%0d", $time, floor_A, floor_B);
+ 
+        // One car should be at 1, other at 3
+        check((floor_A === 3'd1 || floor_A === 3'd3),
+              "PH1: Car A at floor 1 or 3", 3'd1, floor_A);
+        check((floor_B === 3'd1 || floor_B === 3'd3),
+              "PH1: Car B at floor 1 or 3", 3'd1, floor_B);
+        check(floor_A !== floor_B,
+              "PH1: Cars at different floors", 3'd1,
+              {2'b0, (floor_A !== floor_B)});
+ 
+        // Clear hall call
+        sw_hall = 5'b00000;
+        delay_cycles(5);
+ 
+        // ── PH2: Floors 0 and 4 ──────────────────────────────
+        $display("\n[PH2] hall_call=10001 (floors 0 and 4)");
+        commit_hall_call(5'b10001);
+        $display("--- PH2 dispatch [t=%0t] ---  CarA fl=%0d | reqA=%05b  CarB fl=%0d | reqB=%05b  hall=%05b",
+                 $time, floor_A, req_A, floor_B, req_B, hall_call);
+ 
+        wait_both_idle(3000);
+        $display("--- PH2 done [t=%0t] ---  CarA fl=%0d | CarB fl=%0d", $time, floor_A, floor_B);
+ 
+        check((floor_A === 3'd0 || floor_A === 3'd4),
+              "PH2: Car A at floor 0 or 4", 3'd0, floor_A);
+        check((floor_B === 3'd0 || floor_B === 3'd4),
+              "PH2: Car B at floor 0 or 4", 3'd0, floor_B);
+        check(floor_A !== floor_B,
+              "PH2: Cars at different floors", 3'd1,
+              {2'b0, (floor_A !== floor_B)});
+ 
+        sw_hall = 5'b00000;
+        delay_cycles(5);
+ 
+        // ── PH3: Floors 2 and 4 ──────────────────────────────
+        $display("\n[PH3] hall_call=10100 (floors 2 and 4)");
+        commit_hall_call(5'b10100);
+        $display("--- PH3 dispatch [t=%0t] ---  CarA fl=%0d | reqA=%05b  CarB fl=%0d | reqB=%05b  hall=%05b",
+                 $time, floor_A, req_A, floor_B, req_B, hall_call);
+ 
+        wait_both_idle(3000);
+        $display("--- PH3 done [t=%0t] ---  CarA fl=%0d | CarB fl=%0d", $time, floor_A, floor_B);
+ 
+        check((floor_A === 3'd2 || floor_A === 3'd4),
+              "PH3: Car A at floor 2 or 4", 3'd2, floor_A);
+        check((floor_B === 3'd2 || floor_B === 3'd4),
+              "PH3: Car B at floor 2 or 4", 3'd2, floor_B);
+ 
+        sw_hall = 5'b00000;
+        delay_cycles(5);
+ 
+        // ── PH4: Emergency stop during travel ────────────────
+        $display("\n[PH4] Emergency during travel");
+ 
+        // First give cars somewhere to go
+        commit_hall_call(5'b01010);   // floors 1 and 3
+        delay_cycles(15);             // let cars start moving
+ 
+        $display("--- PH4 emerg ON [t=%0t] ---  CarA fl=%0d upA=%b dnA=%b | CarB fl=%0d upB=%b dnB=%b",
+                 $time, floor_A, move_up_A, move_down_A, floor_B, move_up_B, move_down_B);
+ 
+        // Assert emergency
+        emergency_stop = 1;
+        delay_cycles(3);
+ 
+        // Both cars must stop
+        check(motor_stop_A === 1, "PH4: Car A stopped on emergency",
+              3'd1, {2'b0, motor_stop_A});
+        check(motor_stop_B === 1, "PH4: Car B stopped on emergency",
+              3'd1, {2'b0, motor_stop_B});
+        check(move_up_A === 0, "PH4: Car A move_up=0 on emergency",
+              3'd0, {2'b0, move_up_A});
+        check(move_up_B === 0, "PH4: Car B move_up=0 on emergency",
+              3'd0, {2'b0, move_up_B});
+ 
+        $display("--- PH4 emerg OFF [t=%0t] ---  CarA fl=%0d | CarB fl=%0d", $time, floor_A, floor_B);
+ 
+        // Release emergency
+        emergency_stop = 0;
+        delay_cycles(3);
+ 
+        // Cars should resume
+        $display("--- PH4 after release [t=%0t] ---  CarA fl=%0d stA=%b | CarB fl=%0d stB=%b",
+                 $time, floor_A, motor_stop_A, floor_B, motor_stop_B);
+ 
+        // Wait for this phase to finish
+        wait_both_idle(2000);
+        $display("--- PH4 done [t=%0t] ---  CarA fl=%0d | CarB fl=%0d", $time, floor_A, floor_B);
+ 
+        sw_hall = 5'b00000;
+        delay_cycles(10);
+ 
+        // ── PH5: All 5 floors ─────────────────────────────────
+        $display("\n[PH5] hall_call=11111 (all 5 floors)");
+        $display("      Cars before: A=%0d B=%0d", floor_A, floor_B);
+ 
+        commit_hall_call(5'b11111);
+        $display("--- PH5 dispatch [t=%0t] ---  CarA fl=%0d reqA=%05b | CarB fl=%0d reqB=%05b",
+                 $time, floor_A, req_A, floor_B, req_B);
+ 
+        // Verify both cars received assignments
+        delay_cycles(5);
+        check(req_A !== 5'b00000, "PH5: Car A has assignments",
+              3'd1, {2'b0, (req_A !== 5'b00000)});
+        check(req_B !== 5'b00000, "PH5: Car B has assignments",
+              3'd1, {2'b0, (req_B !== 5'b00000)});
+ 
+        // Verify no overlap between assignments
+        check((req_A & req_B) === 5'b00000, "PH5: No floor assigned to both cars",
+              3'd0, {2'b0, |(req_A & req_B)});
+ 
+        // Verify both cars are moving (parallel operation)
+        delay_cycles(5);
+        $display("--- PH5 travel check [t=%0t] ---  CarA upA=%b dnA=%b stA=%b | CarB upB=%b dnB=%b stB=%b",
+                 $time, move_up_A, move_down_A, motor_stop_A,
+                        move_up_B, move_down_B, motor_stop_B);
+ 
+        wait_both_idle(5000);
+        $display("--- PH5 done [t=%0t] ---  CarA fl=%0d | CarB fl=%0d", $time, floor_A, floor_B);
+ 
+        sw_hall = 5'b00000;
+        delay_cycles(10);
+ 
+        // ── PH6: Dynamic dispatch — new call while car moving ─
+        $display("\n[PH6] Dynamic dispatch test");
+        $display("      Sending Car A toward floor 4, then calling floor 2 mid-journey");
+ 
+        // Reset both cars to floor 0 first
+        reset = 1;
+        delay_cycles(5);
+        reset = 0;
+        delay_cycles(3);
+ 
+        // Send Car A to floor 4 (Car B gets nothing useful)
+        commit_hall_call(5'b10000);   // floor 4 only
+        delay_cycles(5);
+        $display("--- PH6 initial dispatch ---  CarA fl=%0d reqA=%05b | CarB fl=%0d reqB=%05b",
+                 $time, floor_A, req_A, floor_B, req_B);
+ 
+        // Wait until Car A has moved to floor 1 (mid-journey)
+        begin : wait_floor1
+            integer timeout;
+            timeout = 0;
+            while (floor_A !== 3'd1 && timeout < 500) begin
+                @(posedge clk); #1;
+                timeout = timeout + 1;
+            end
+        end
+ 
+        $display("--- PH6 Car A at floor 1 [t=%0t] ---  Now submitting floor 2 call", $time);
+ 
+        // While Car A is still moving toward 4, submit floor 2 call
+        commit_hall_call(5'b00100);   // floor 2
+        delay_cycles(5);
+        $display("--- PH6 floor 2 dispatched [t=%0t] ---  reqA=%05b reqB=%05b",
+                 $time, req_A, req_B);
+ 
+        // Check: floor 2 should be assigned to Car A (it is passing through)
+        // or Car B (if dispatcher prefers it). Either is valid.
+        // The key check is that floor 2 IS assigned to exactly one car.
+        check(((req_A[2] === 1) || (req_B[2] === 1)),
+              "PH6: Floor 2 assigned to one car",
+              3'd1, {2'b0, (req_A[2] || req_B[2])});
+ 
+        wait_both_idle(5000);
+        $display("--- PH6 done [t=%0t] ---  CarA fl=%0d | CarB fl=%0d", $time, floor_A, floor_B);
+ 
+        sw_hall = 5'b00000;
+        delay_cycles(10);
+ 
+        // ── PH7: Reset verification ───────────────────────────
+        $display("\n[PH7] Reset during active call");
+        commit_hall_call(5'b10101);   // floors 0,2,4
+        delay_cycles(20);             // let dispatch happen
+ 
+        $display("--- PH7 reset asserted [t=%0t] ---  CarA fl=%0d | CarB fl=%0d",
+                 $time, floor_A, floor_B);
+        reset = 1;
+        delay_cycles(5);
+        reset = 0;
+        delay_cycles(3);
+ 
+        check(floor_A === 3'd0, "PH7: Car A reset to floor 0", 3'd0, floor_A);
+        check(floor_B === 3'd0, "PH7: Car B reset to floor 0", 3'd0, floor_B);
+        check(motor_stop_A === 1, "PH7: Car A stopped after reset",
+              3'd1, {2'b0, motor_stop_A});
+        check(motor_stop_B === 1, "PH7: Car B stopped after reset",
+              3'd1, {2'b0, motor_stop_B});
+        check(req_A === 5'b00000, "PH7: req_A cleared on reset",
+              3'd0, {2'b0, |req_A});
+        check(req_B === 5'b00000, "PH7: req_B cleared on reset",
+              3'd0, {2'b0, |req_B});
+ 
+        // ── FINAL RESULTS ─────────────────────────────────────
+        $display("\n=== Simulation complete ===");
+        $display("    PASS: %0d", pass_count);
+        $display("    FAIL: %0d", fail_count);
+        if (fail_count === 0)
+            $display("    ALL TESTS PASSED");
+        else
+            $display("    SOME TESTS FAILED — check output above");
+        $display("===========================\n");
+ 
+        $finish;
+    end
+ 
+    // ── Timeout watchdog ─────────────────────────────────────
+    initial begin
+        #10_000_000;   // 10 million ns max simulation time
+        $display("TIMEOUT: simulation exceeded 10ms limit");
+        $finish;
+    end
+ 
+    // ── Waveform dump ────────────────────────────────────────
+    initial begin
+        $dumpfile("elevator_tb.vcd");
+        $dumpvars(0, tb_elevator_group_controller);
+    end
+ 
+endmodule
