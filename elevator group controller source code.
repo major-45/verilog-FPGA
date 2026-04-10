@@ -1,0 +1,467 @@
+`timescale 1ns/1ps
+module lift_controller #(
+    parameter MOVE_DELAY = 100_000_000
+)(
+    input        clk,
+    input        reset,
+    input  [4:0] assigned_req,
+    input        emergency_stop,
+    output reg   move_up,
+    output reg   move_down,
+    output reg   motor_stop,
+    output reg   [2:0] current_floor,
+    output wire        last_dir_out    // NEW: exposes last_dir to top
+);
+    localparam IDLE      = 2'b00;
+    localparam MOVE_UP   = 2'b01;
+    localparam MOVE_DOWN = 2'b10;
+    localparam EMERGENCY = 2'b11;
+ 
+    reg [1:0]  current_state, next_state;
+ 
+    // ----------------------------------------------------------
+    // Move-enable counter
+    // ----------------------------------------------------------
+    reg [24:0] move_cnt;
+    wire       move_enable = (move_cnt == 25'd0);
+    always @(posedge clk or posedge reset) begin
+        if (reset)            move_cnt <= MOVE_DELAY - 1;
+        else if (move_enable) move_cnt <= MOVE_DELAY - 1;
+        else                  move_cnt <= move_cnt - 1'b1;
+    end
+ 
+    // ----------------------------------------------------------
+    // Internal registers
+    // ----------------------------------------------------------
+    reg       last_dir;          // 1=last went UP, 0=last went DOWN
+    reg [4:0] pending_req;
+    reg [2:0] target_floor;
+    reg [4:0] already_served;
+ 
+    assign last_dir_out = last_dir;
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            pending_req    <= 5'b00000;
+            already_served <= 5'b00000;
+        end else begin
+            already_served <= already_served & assigned_req;
+            pending_req <= pending_req
+                         | (assigned_req
+                            & ~already_served
+                            & ~(5'b00001 << current_floor));
+            if (next_state == IDLE) begin
+                pending_req[current_floor]    <= 1'b0;
+                already_served[current_floor] <= 1'b1;
+            end
+        end
+    end
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    reg [2:0] target_next;
+    reg       dir_next;
+ 
+    always @(*) begin
+        target_next = current_floor;
+        dir_next    = last_dir;
+ 
+        if (!emergency_stop) begin
+            if (last_dir == 1'b1) begin
+                if      (pending_req[1] && current_floor < 3'd1)
+                    begin target_next = 3'd1; dir_next = 1'b1; end
+                else if (pending_req[2] && current_floor < 3'd2)
+                    begin target_next = 3'd2; dir_next = 1'b1; end
+                else if (pending_req[3] && current_floor < 3'd3)
+                    begin target_next = 3'd3; dir_next = 1'b1; end
+                else if (pending_req[4] && current_floor < 3'd4)
+                    begin target_next = 3'd4; dir_next = 1'b1; end
+                // None above - reverse and serve below
+                else if (pending_req[3] && current_floor > 3'd3)
+                    begin target_next = 3'd3; dir_next = 1'b0; end
+                else if (pending_req[2] && current_floor > 3'd2)
+                    begin target_next = 3'd2; dir_next = 1'b0; end
+                else if (pending_req[1] && current_floor > 3'd1)
+                    begin target_next = 3'd1; dir_next = 1'b0; end
+                else if (pending_req[0] && current_floor > 3'd0)
+                    begin target_next = 3'd0; dir_next = 1'b0; end
+            end else begin
+                // Going DOWN - serve floors below first
+                if      (pending_req[3] && current_floor > 3'd3)
+                    begin target_next = 3'd3; dir_next = 1'b0; end
+                else if (pending_req[2] && current_floor > 3'd2)
+                    begin target_next = 3'd2; dir_next = 1'b0; end
+                else if (pending_req[1] && current_floor > 3'd1)
+                    begin target_next = 3'd1; dir_next = 1'b0; end
+                else if (pending_req[0] && current_floor > 3'd0)
+                    begin target_next = 3'd0; dir_next = 1'b0; end
+                // None below - reverse and serve above
+                else if (pending_req[1] && current_floor < 3'd1)
+                    begin target_next = 3'd1; dir_next = 1'b1; end
+                else if (pending_req[2] && current_floor < 3'd2)
+                    begin target_next = 3'd2; dir_next = 1'b1; end
+                else if (pending_req[3] && current_floor < 3'd3)
+                    begin target_next = 3'd3; dir_next = 1'b1; end
+                else if (pending_req[4] && current_floor < 3'd4)
+                    begin target_next = 3'd4; dir_next = 1'b1; end
+            end
+        end
+    end
+ 
+  
+    // ----------------------------------------------------------
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            target_floor <= 3'd0;
+            last_dir     <= 1'b1;   // start biased UP from floor 0
+        end else if (current_state == IDLE) begin
+            target_floor <= target_next;
+            // Override last_dir at extreme floors
+            if (current_floor == 3'd4)
+                last_dir <= 1'b0;   // top floor → must go DOWN
+            else if (current_floor == 3'd0)
+                last_dir <= 1'b1;   // bottom floor → must go UP
+            else
+                last_dir <= dir_next;
+        end
+    end
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    always @(posedge clk or posedge reset) begin
+        if (reset) current_state <= IDLE;
+        else       current_state <= next_state;
+    end
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    always @(posedge clk or posedge reset) begin
+        if (reset) current_floor <= 3'd0;
+        else if (move_enable) begin
+            if      (current_state == MOVE_UP   && current_floor < target_floor)
+                current_floor <= current_floor + 1'b1;
+            else if (current_state == MOVE_DOWN && current_floor > target_floor)
+                current_floor <= current_floor - 1'b1;
+        end
+    end
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    always @(*) begin
+        next_state = current_state;
+        if (emergency_stop) next_state = EMERGENCY;
+        else case (current_state)
+            IDLE: begin
+                if      (target_next > current_floor) next_state = MOVE_UP;
+                else if (target_next < current_floor) next_state = MOVE_DOWN;
+            end
+            MOVE_UP:   if (current_floor == target_floor) next_state = IDLE;
+            MOVE_DOWN: if (current_floor == target_floor) next_state = IDLE;
+            EMERGENCY: if (!emergency_stop)               next_state = IDLE;
+            default:   next_state = IDLE;
+        endcase
+    end
+ 
+    always @(*) begin
+        move_up = 1'b0; move_down = 1'b0; motor_stop = 1'b0;
+        case (current_state)
+            MOVE_UP:   move_up    = 1'b1;
+            MOVE_DOWN: move_down  = 1'b1;
+            default:   motor_stop = 1'b1;
+        endcase
+    end
+ 
+endmodule
+ `timescale 1ns / 1ps
+module group_dispatcher (
+    input        clk,
+    input        reset,
+    input  [4:0] hall_call,
+    input  [2:0] floor_A,
+    input  [2:0] floor_B,
+    input        move_up_A,
+    input        move_up_B,
+    input        move_down_A,
+    input        move_down_B,
+    input        stop_A,
+    input        stop_B,
+    input        last_dir_A,     // NEW: last direction of Car A
+    input        last_dir_B,     // NEW: last direction of Car B
+    output reg [4:0] req_A,
+    output reg [4:0] req_B
+);
+    reg [4:0] served_call;
+    wire [4:0] new_call = hall_call & ~served_call;
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    function [2:0] absdiff;
+        input [2:0] a, b;
+        begin absdiff = (a >= b) ? (a - b) : (b - a); end
+    endfunction
+ 
+    // ----------------------------------------------------------
+  function [2:0] dir_penalty;
+    input [2:0] car_floor;
+    input [2:0] target;
+    input       going_up;
+    input       going_down;
+    input       idle;
+    input       last_dir;
+    begin
+        // ── NEW: car is already at the requested floor ──────────────────
+        if (target == car_floor) begin
+            dir_penalty = 3'd0;
+        // ── moving car ──────────────────────────────────────────────────
+        end else if (!idle) begin
+            if (going_up && target > car_floor)
+                dir_penalty = 3'd0;
+            else if (going_down && target < car_floor)
+                dir_penalty = 3'd0;
+            else
+                dir_penalty = 3'd4;
+        // ── idle car ────────────────────────────────────────────────────
+        end else begin
+            if (last_dir == 1'b1) begin
+                if (target > car_floor)
+                    dir_penalty = 3'd1;
+                else
+                    dir_penalty = 3'd3;
+            end else begin
+                if (target < car_floor)
+                    dir_penalty = 3'd1;
+                else
+                    dir_penalty = 3'd3;
+            end
+        end
+    end
+endfunction
+ 
+    reg [2:0] base_cost_A [0:4];
+    reg [2:0] base_cost_B [0:4];
+    integer   i;
+ 
+    always @(*) begin
+        for (i = 0; i < 5; i = i + 1) begin
+            base_cost_A[i] = absdiff(floor_A, i[2:0])
+                           + dir_penalty(floor_A, i[2:0],
+                                         move_up_A, move_down_A,
+                                         stop_A, last_dir_A);
+            base_cost_B[i] = absdiff(floor_B, i[2:0])
+                           + dir_penalty(floor_B, i[2:0],
+                                         move_up_B, move_down_B,
+                                         stop_B, last_dir_B);
+        end
+    end
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            req_A       <= 5'b00000;
+            req_B       <= 5'b00000;
+            served_call <= 5'b00000;
+        end else begin
+            served_call <= served_call & hall_call;
+            req_A       <= req_A & hall_call;
+            req_B       <= req_B & hall_call;
+ 
+            if (new_call != 5'b00000) begin
+                begin : dispatch_block
+                    integer load_A, load_B;
+                    integer best_i, best_diff, curr_diff;
+                    integer eff_A, eff_B;
+                    integer pass, j;
+                    reg [4:0] remaining;
+ 
+                    load_A    = 0;
+                    load_B    = 0;
+                    remaining = new_call;
+ 
+                    for (pass = 0; pass < 5; pass = pass + 1) begin
+                        if (remaining != 5'b00000) begin
+                            best_i    = -1;
+                            best_diff = -1;
+ 
+                            for (j = 0; j < 5; j = j + 1) begin
+                                if (remaining[j]) begin
+                                    eff_A = base_cost_A[j]
+                                          + (load_A > 0 ? 10 : 0);
+                                    eff_B = base_cost_B[j]
+                                          + (load_B > 0 ? 10 : 0);
+                                    curr_diff = (eff_A > eff_B)
+                                              ? (eff_A - eff_B)
+                                              : (eff_B - eff_A);
+                                    if (curr_diff > best_diff) begin
+                                        best_diff = curr_diff;
+                                        best_i    = j;
+                                    end
+                                end
+                            end
+ 
+                            if (best_i >= 0) begin
+                                eff_A = base_cost_A[best_i]
+                                      + (load_A > 0 ? 10 : 0);
+                                eff_B = base_cost_B[best_i]
+                                      + (load_B > 0 ? 10 : 0);
+ 
+                                if (eff_A < eff_B) begin
+                                    req_A[best_i]       <= 1'b1;
+                                    served_call[best_i] <= 1'b1;
+                                    load_A = load_A + 1;
+                                end else if (eff_B < eff_A) begin
+                                    req_B[best_i]       <= 1'b1;
+                                    served_call[best_i] <= 1'b1;
+                                    load_B = load_B + 1;
+                                end else begin
+                                    if (load_A <= load_B) begin
+                                        req_A[best_i]       <= 1'b1;
+                                        served_call[best_i] <= 1'b1;
+                                        load_A = load_A + 1;
+                                    end else begin
+                                        req_B[best_i]       <= 1'b1;
+                                        served_call[best_i] <= 1'b1;
+                                        load_B = load_B + 1;
+                                    end
+                                end
+                                remaining[best_i] = 1'b0;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+endmodule
+
+`timescale 1ns / 1ps
+module group_controller_top #(
+    parameter MOVE_DELAY = 100_000_000
+)(
+    input        clk,
+    input        reset,
+    input  [4:0] sw_hall,
+    input        btn_commit,
+    input        emergency_stop,
+ 
+    output wire  move_up_A,
+    output wire  move_down_A,
+    output wire  motor_stop_A,
+ 
+    output wire  move_up_B,
+    output wire  move_down_B,
+    output wire  motor_stop_B,
+ 
+    output reg  [6:0] seg,
+    output wire        dp,
+    output reg  [7:0] an
+);
+    wire [2:0] floor_A, floor_B;
+    wire [4:0] req_A,   req_B;
+    wire move_up_A_w,  move_down_A_w,  stop_A_w;
+    wire move_up_B_w,  move_down_B_w,  stop_B_w;
+    wire last_dir_A,   last_dir_B;     // NEW wires
+ 
+    // ----------------------------------------------------------
+    // Commit latch (unchanged)
+    // ----------------------------------------------------------
+    reg [4:0] hall_call;
+    reg       btn_prev;
+    wire      btn_rising = btn_commit & ~btn_prev;
+ 
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            hall_call <= 5'b00000;
+            btn_prev  <= 1'b0;
+        end else begin
+            btn_prev <= btn_commit;
+            if (btn_rising)
+                hall_call <= sw_hall;
+        end
+    end
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    lift_controller #(.MOVE_DELAY(MOVE_DELAY)) car_A (
+        .clk(clk), .reset(reset),
+        .assigned_req(req_A),
+        .emergency_stop(emergency_stop),
+        .move_up(move_up_A),
+        .move_down(move_down_A),
+        .motor_stop(motor_stop_A),
+        .current_floor(floor_A),
+        .last_dir_out(last_dir_A)        // NEW
+    );
+    assign move_up_A_w   = move_up_A;
+    assign move_down_A_w = move_down_A;
+    assign stop_A_w      = motor_stop_A;
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    lift_controller #(.MOVE_DELAY(MOVE_DELAY)) car_B (
+        .clk(clk), .reset(reset),
+        .assigned_req(req_B),
+        .emergency_stop(emergency_stop),
+        .move_up(move_up_B),
+        .move_down(move_down_B),
+        .motor_stop(motor_stop_B),
+        .current_floor(floor_B),
+        .last_dir_out(last_dir_B)        // NEW
+    );
+    assign move_up_B_w   = move_up_B;
+    assign move_down_B_w = move_down_B;
+    assign stop_B_w      = motor_stop_B;
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    group_dispatcher dispatcher (
+        .clk(clk), .reset(reset),
+        .hall_call(hall_call),
+        .floor_A(floor_A),   .floor_B(floor_B),
+        .move_up_A(move_up_A_w),   .move_up_B(move_up_B_w),
+        .move_down_A(move_down_A_w), .move_down_B(move_down_B_w),
+        .stop_A(stop_A_w),   .stop_B(stop_B_w),
+        .last_dir_A(last_dir_A),   .last_dir_B(last_dir_B),  // NEW
+        .req_A(req_A),       .req_B(req_B)
+    );
+ 
+    // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    reg [15:0] refresh_cnt;
+    always @(posedge clk or posedge reset) begin
+        if (reset) refresh_cnt <= 16'd0;
+        else       refresh_cnt <= refresh_cnt + 1'b1;
+    end
+ 
+    wire [1:0] slot = refresh_cnt[15:14];
+ 
+    function [6:0] floor_seg;
+        input [2:0] floor;
+        begin
+            case (floor)
+                3'd0: floor_seg = 7'b000_0001; // "0"
+                3'd1: floor_seg = 7'b100_1111; // "1"
+                3'd2: floor_seg = 7'b001_0010; // "2"
+                3'd3: floor_seg = 7'b000_0110; // "3"
+                3'd4: floor_seg = 7'b100_1100; // "4"
+                default: floor_seg = 7'b111_1111;
+            endcase
+        end
+    endfunction
+ 
+    always @(*) begin
+        case (slot)
+            2'b00: begin seg = 7'b000_1000; an = 8'b0111_1111; end // "A"
+            2'b01: begin seg = floor_seg(floor_A); an = 8'b1110_1111; end
+            2'b10: begin seg = 7'b11000_00; an = 8'b1111_0111; end // "b"
+            2'b11: begin seg = floor_seg(floor_B); an = 8'b1111_1110; end
+            default: begin seg = 7'b111_1111; an = 8'b1111_1111; end
+        endcase
+    end
+ 
+    assign dp = 1'b1;
+ 
+endmodule
+ 
